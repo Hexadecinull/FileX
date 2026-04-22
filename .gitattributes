@@ -1,0 +1,35 @@
+* text=auto eol=lf
+
+*.php text eol=lf
+*.js text eol=lf
+*.css text eol=lf
+*.html text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.txt text eol=lf
+*.sh text eol=lf shell
+
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.webp binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.otf binary
+*.eot binary
+
+*.php diff=php
+*.js diff=javascript
+*.css diff=css
+*.html diff=html
+
+export-ignore .github
+export-ignore .gitignore
+export-ignore .gitattributes
+export-ignore docs/
+export-ignore *.md

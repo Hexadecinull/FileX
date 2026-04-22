@@ -1,0 +1,51 @@
+name: Deploy to InfinityFree
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    name: FTP Deploy
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify PHP files before deploy
+        run: |
+          echo "Running pre-deploy PHP syntax check..."
+          find public/api -name "*.php" -print0 | xargs -0 -I{} php -l {}
+          echo "All PHP files passed syntax check."
+
+      - name: Deploy via FTP to InfinityFree
+        uses: SamKirkland/FTP-Deploy-Action@v4.3.5
+        with:
+          server:           ${{ secrets.FTP_HOST }}
+          username:         ${{ secrets.FTP_USERNAME }}
+          password:         ${{ secrets.FTP_PASSWORD }}
+          local-dir:        ./public/
+          server-dir:       /file-x.ct.ws/htdocs/
+          protocol:         ftp
+          port:             21
+          timeout:          30000
+          exclude:          |
+            **/.git*
+            **/.git*/**
+            **/node_modules/**
+            **/*.bak
+            **/*.log
+
+      - name: Post-deploy notification
+        if: success()
+        run: |
+          echo "Deployment succeeded."
+          echo "Live at: http://${{ secrets.FTP_HOST }}"
+
+      - name: Failure notification
+        if: failure()
+        run: |
+          echo "Deployment FAILED. Check FTP credentials and server status."
+          exit 1

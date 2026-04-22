@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="FileX — Domain file structure reconstructor. Probe, crawl, and visualize any domain's internal architecture.">
+    <meta name="author" content="FileX Contributors">
+    <meta name="license" content="GPL-3.0">
+    <title>FileX — Domain Structure Reconstructor</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&family=Space+Grotesk:wght@400;500;600&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="assets/css/filex.css">
+</head>
+<body>
+    <div id="app">
+
+        <header class="header">
+            <div class="header-left">
+                <div class="logo">
+                    <span class="logo-bracket">[</span>
+                    <span class="logo-text">FILE</span>
+                    <span class="logo-x">X</span>
+                    <span class="logo-bracket">]</span>
+                </div>
+                <span class="logo-tagline">domain structure reconstructor</span>
+            </div>
+            <div class="header-right">
+                <span class="license-badge">GPL-3.0</span>
+                <a class="github-link" href="https://github.com/hexadecinull/filex" target="_blank" rel="noopener">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.374 0 0 5.373 0 12c0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23A11.509 11.509 0 0 1 12 5.803c1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576C20.566 21.797 24 17.3 24 12c0-6.627-5.373-12-12-12z"/></svg>
+                    GitHub
+                </a>
+            </div>
+        </header>
+
+        <main class="main">
+
+            <section class="scan-panel">
+                <div class="scan-header">
+                    <div class="scan-title">
+                        <span class="prompt-char">$</span>
+                        <span>Target Domain</span>
+                    </div>
+                    <div class="scan-subtitle">Enter a domain or subdomain — no protocol, no trailing slash</div>
+                </div>
+
+                <div class="input-row">
+                    <div class="input-wrapper">
+                        <span class="input-prefix">https://</span>
+                        <input
+                            type="text"
+                            id="domainInput"
+                            class="domain-input"
+                            placeholder="example.com or sub.example.com"
+                            autocomplete="off"
+                            spellcheck="false"
+                        >
+                        <button id="clearBtn" class="clear-btn" title="Clear" style="display:none">✕</button>
+                    </div>
+                    <button id="scanBtn" class="scan-btn">
+                        <span class="scan-btn-text">RECONSTRUCT</span>
+                        <span class="scan-btn-icon">▶</span>
+                    </button>
+                    <button id="stopBtn" class="stop-btn" style="display:none">■ STOP</button>
+                </div>
+
+                <div class="options-row">
+                    <label class="option-toggle">
+                        <input type="checkbox" id="optRobots" checked>
+                        <span>robots.txt</span>
+                    </label>
+                    <label class="option-toggle">
+                        <input type="checkbox" id="optSitemap" checked>
+                        <span>Sitemap</span>
+                    </label>
+                    <label class="option-toggle">
+                        <input type="checkbox" id="optWayback" checked>
+                        <span>Wayback Machine</span>
+                    </label>
+                    <label class="option-toggle">
+                        <input type="checkbox" id="optDns" checked>
+                        <span>DNS + Subdomains</span>
+                    </label>
+                    <label class="option-toggle">
+                        <input type="checkbox" id="optCerts" checked>
+                        <span>Cert Transparency</span>
+                    </label>
+                    <label class="option-toggle">
+                        <input type="checkbox" id="optCrawl" checked>
+                        <span>Wordlist Crawl</span>
+                    </label>
+                    <label class="option-toggle">
+                        <input type="checkbox" id="optProbeLinks">
+                        <span>Probe Discovered Links</span>
+                    </label>
+                    <div class="option-select-wrap">
+                        <label class="option-label" for="optScheme">Scheme</label>
+                        <select id="optScheme" class="option-select">
+                            <option value="https">HTTPS</option>
+                            <option value="http">HTTP</option>
+                        </select>
+                    </div>
+                    <div class="option-select-wrap">
+                        <label class="option-label" for="optBatch">Batch size</label>
+                        <select id="optBatch" class="option-select">
+                            <option value="25">25</option>
+                            <option value="50" selected>50</option>
+                            <option value="100">100</option>
+                        </select>
+                    </div>
+                </div>
+            </section>
+
+            <div id="progressSection" class="progress-section" style="display:none">
+                <div class="progress-bar-track">
+                    <div id="progressBar" class="progress-bar-fill"></div>
+                </div>
+                <div class="progress-stages">
+                    <span id="stageRobots"    class="stage">robots.txt</span>
+                    <span id="stageSitemap"   class="stage">sitemap</span>
+                    <span id="stageWayback"   class="stage">wayback</span>
+                    <span id="stageDns"       class="stage">dns</span>
+                    <span id="stageCerts"     class="stage">certs</span>
+                    <span id="stageCrawl"     class="stage">crawl</span>
+                    <span id="stageProbe"     class="stage">probing</span>
+                    <span id="stageBuilding"  class="stage">building</span>
+                </div>
+                <div id="progressLog" class="progress-log"></div>
+            </div>
+
+            <div id="resultsSection" class="results-section" style="display:none">
+
+                <div class="results-header">
+                    <div class="results-title-row">
+                        <h2 class="results-title" id="resultsTitle">Structure</h2>
+                        <div class="results-actions">
+                            <button class="action-btn" id="expandAllBtn">Expand All</button>
+                            <button class="action-btn" id="collapseAllBtn">Collapse All</button>
+                            <button class="action-btn" id="filterInterestingBtn">⚡ Interesting Only</button>
+                            <div class="export-group">
+                                <button class="action-btn action-btn--primary" id="exportJsonBtn">Export JSON</button>
+                                <button class="action-btn action-btn--primary" id="exportTextBtn">Export Tree</button>
+                                <button class="action-btn action-btn--primary" id="exportCsvBtn">Export CSV</button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="stats-row" id="statsRow"></div>
+                </div>
+
+                <div class="results-layout">
+
+                    <div class="panel panel--info">
+                        <div class="panel-title">📡 Target Info</div>
+                        <div id="targetInfo" class="info-grid"></div>
+                    </div>
+
+                    <div class="panel panel--tech">
+                        <div class="panel-title">🔬 Detected Technologies</div>
+                        <div id="techList" class="tag-cloud"></div>
+                    </div>
+
+                    <div class="panel panel--dns">
+                        <div class="panel-title">🌐 DNS + Subdomains</div>
+                        <div id="dnsInfo" class="dns-grid"></div>
+                    </div>
+
+                    <div class="panel panel--certs">
+                        <div class="panel-title">🔐 Certificate Subdomains</div>
+                        <div id="certList" class="cert-list"></div>
+                    </div>
+
+                </div>
+
+                <div class="tree-section">
+                    <div class="tree-header">
+                        <div class="tree-search-wrap">
+                            <input type="text" id="treeSearch" class="tree-search" placeholder="Filter paths…">
+                        </div>
+                        <div class="legend">
+                            <span class="legend-item legend--200">200</span>
+                            <span class="legend-item legend--3xx">3xx</span>
+                            <span class="legend-item legend--401">401/403</span>
+                            <span class="legend-item legend--404">404</span>
+                            <span class="legend-item legend--dir">DIR</span>
+                            <span class="legend-item legend--interesting">⚡ interesting</span>
+                        </div>
+                    </div>
+                    <div id="fileTree" class="file-tree"></div>
+                </div>
+
+                <div class="sources-section">
+                    <div class="panel-title">📦 Sources</div>
+                    <div id="sourcesList" class="sources-list"></div>
+                </div>
+
+            </div>
+
+            <div id="errorSection" class="error-section" style="display:none">
+                <div class="error-box">
+                    <span class="error-icon">✗</span>
+                    <div id="errorMessage" class="error-message"></div>
+                </div>
+            </div>
+
+        </main>
+
+        <footer class="footer">
+            <span>FileX &mdash; GPL-3.0 &mdash; <a href="https://github.com/hexadecinull/filex" target="_blank" rel="noopener">github.com/hexadecinull/filex</a></span>
+            <span>Use responsibly and only on domains you own or have permission to test.</span>
+        </footer>
+
+    </div>
+
+    <script src="assets/js/filex.js" type="module"></script>
+</body>
+</html>

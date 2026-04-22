@@ -1,0 +1,104 @@
+name: Lint
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint-php:
+    name: PHP Syntax Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.2'
+          tools: php-cs-fixer
+
+      - name: PHP Syntax Lint
+        run: |
+          find public/api -name "*.php" -print0 | xargs -0 -I{} php -l {}
+
+      - name: PHP CS Fixer (dry-run)
+        run: |
+          php-cs-fixer fix public/api --dry-run --diff --rules=@PSR12 || true
+
+  lint-js:
+    name: JavaScript Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install ESLint
+        run: npm install --no-save eslint@9
+
+      - name: Write ESLint config
+        run: |
+          cat > eslint.config.mjs << 'EOF'
+          export default [
+            {
+              files: ["public/assets/js/**/*.js"],
+              languageOptions: {
+                ecmaVersion: 2022,
+                sourceType: "module",
+                globals: {
+                  window: "readonly",
+                  document: "readonly",
+                  fetch: "readonly",
+                  URL: "readonly",
+                  URLSearchParams: "readonly",
+                  AbortController: "readonly",
+                  Blob: "readonly",
+                  Set: "readonly",
+                  Map: "readonly",
+                  console: "readonly",
+                  Date: "readonly",
+                  parseInt: "readonly",
+                  JSON: "readonly",
+                  Math: "readonly",
+                  String: "readonly",
+                }
+              },
+              rules: {
+                "no-unused-vars": "warn",
+                "no-undef": "error",
+                "no-console": "off",
+                "eqeqeq": "error",
+                "no-var": "error",
+                "prefer-const": "warn",
+              }
+            }
+          ];
+          EOF
+
+      - name: Run ESLint
+        run: npx eslint public/assets/js/
+
+  lint-html:
+    name: HTML Validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install html-validate
+        run: npm install --no-save html-validate
+
+      - name: Validate HTML
+        run: npx html-validate public/index.html || true
