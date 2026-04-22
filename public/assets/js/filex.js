@@ -205,9 +205,11 @@ async function runScan(domain) {
             data.dns = r;
             (r.subdomains ?? []).forEach(sub => {
                 data.sources.dns++;
-                addEntry(data, '/', 'dns', null, sub);
             });
-            log(`DNS → ${r.ipv4?.length ?? 0} IPs, ${r.subdomains?.length ?? 0} subdomains found`, 'success');
+            const wildcardNote = r.wildcardDetected
+                ? ' (wildcard DNS detected — only distinct-IP subdomains shown)'
+                : '';
+            log(`DNS → ${r.ipv4?.length ?? 0} IPs, ${r.subdomains?.length ?? 0} real subdomains${wildcardNote}`, 'success');
             setStage('Dns', 'done');
         } catch (e) {
             if (e.name === 'AbortError') throw e;
@@ -244,17 +246,32 @@ async function runScan(domain) {
         let   offset   = 0;
         let   total    = null;
         let   failures = 0;
+        let   baselineEncoded = null;
 
         log(`Starting wordlist crawl (batch=${batch})…`);
 
         while (true) {
             try {
-                const r = await apiFetch('crawl.php', { domain, scheme, batch, offset }, signal);
+                const params = { domain, scheme, batch, offset };
+                if (baselineEncoded) params.baseline = baselineEncoded;
+
+                const r = await apiFetch('crawl.php', params, signal);
                 failures = 0;
+
+                if (r.baseline) {
+                    data.crawlBaseline = r.baseline;
+                    baselineEncoded    = r.baselineEncoded ?? null;
+                    const b = r.baseline;
+                    if (b.reliable) {
+                        log(`Baseline fingerprint: status=${b.status} bodyLen≈${b.bodyLen}b — false positives will be filtered`, 'success');
+                    } else {
+                        log(`Baseline unreliable (mixed responses) — results may include false positives`, 'warn');
+                    }
+                }
 
                 if (total === null) {
                     total = r.total ?? 0;
-                    log(`Wordlist has ${total} paths to probe`);
+                    log(`Wordlist: ${total} paths to probe`);
                 }
 
                 const batchResults = r.results ?? [];
@@ -265,15 +282,14 @@ async function runScan(domain) {
 
                 const done    = offset + batch;
                 const pct     = 60 + Math.min(25, Math.round((done / (total || 1)) * 25));
-                const hits    = data.crawl.filter(x => x.status > 0 && x.status !== 404).length;
-                const newHits = batchResults.filter(x => x.status > 0 && x.status !== 404);
+                const newHits = batchResults.filter(x => x.interesting);
 
                 setProgress(pct);
 
                 if (newHits.length > 0) {
-                    log(`Batch ${offset}–${Math.min(done, total)}: ${newHits.map(x => x.path + ' [' + x.status + ']').join(', ')}`, 'success');
+                    log(`[${offset}–${Math.min(done, total)}] HIT: ${newHits.map(x => x.path + ' [' + x.status + ']').join(', ')}`, 'success');
                 } else {
-                    log(`Batch ${offset}–${Math.min(done, total)}: no hits (total live: ${hits})`);
+                    log(`[${offset}–${Math.min(done, total)}] — ${batchResults.length} probed, 0 real hits`);
                 }
 
                 offset += batch;
@@ -293,14 +309,13 @@ async function runScan(domain) {
             }
         }
 
-        const hits = data.crawl.filter(x => x.status > 0 && x.status !== 404);
+        const hits = data.crawl.filter(x => x.interesting);
         if (hits.length > 0) {
-            log(`Crawl complete — ${hits.length} live paths from ${total ?? 0} probed`, 'success');
-            setStage('Crawl', 'done');
-        } else if (total !== null) {
-            log(`Crawl complete — 0 live paths from ${total} probed`);
-            setStage('Crawl', 'done');
+            log(`Crawl complete — ${hits.length} real paths found from ${total ?? 0} probed`, 'success');
+        } else {
+            log(`Crawl complete — no paths found after baseline filtering (${total ?? 0} probed)`);
         }
+        setStage('Crawl', 'done');
         data.sources.crawl = total ?? 0;
     } else {
         setStage('Crawl', 'skipped');
@@ -486,28 +501,46 @@ function renderDnsInfo(data) {
         return;
     }
 
+    if (dns.wildcardDetected) {
+        const warn = document.createElement('div');
+        warn.style.cssText = 'font-size:.72rem;color:var(--amber);background:rgba(255,179,71,.08);border:1px solid var(--amber-dim);border-radius:3px;padding:4px 8px;margin-bottom:8px;';
+        warn.textContent = '⚠ Wildcard DNS detected — *.' + dns.domain + ' resolves. Only subdomains with distinct IPs are shown.';
+        el.appendChild(warn);
+    }
+
     const sections = [
         { title: 'IPv4',        items: dns.ipv4 ?? [] },
         { title: 'IPv6',        items: dns.ipv6 ?? [] },
         { title: 'Nameservers', items: dns.nameservers ?? [] },
-        { title: 'Subdomains',  items: dns.subdomains ?? [], cls: 'dns-subdomain' },
+        {
+            title: dns.wildcardDetected ? 'Real Subdomains (non-wildcard)' : 'Subdomains',
+            items: dns.subdomains ?? [],
+            cls:   'dns-subdomain',
+        },
     ];
 
     sections.forEach(({ title, items, cls }) => {
         if (items.length === 0) return;
         const sec = document.createElement('div');
         const t   = document.createElement('div');
-        t.className = 'dns-section-title';
+        t.className   = 'dns-section-title';
         t.textContent = title;
         sec.appendChild(t);
-        items.slice(0, 20).forEach(item => {
+        items.slice(0, 30).forEach(item => {
             const d = document.createElement('div');
-            d.className = cls || 'dns-record';
+            d.className   = cls || 'dns-record';
             d.textContent = item;
             sec.appendChild(d);
         });
         el.appendChild(sec);
     });
+
+    if ((dns.subdomains ?? []).length === 0 && dns.wildcardDetected) {
+        const none = document.createElement('div');
+        none.style.cssText = 'font-size:.72rem;color:var(--text-muted);margin-top:4px;';
+        none.textContent = 'No subdomains with distinct IPs found.';
+        el.appendChild(none);
+    }
 }
 
 function renderCertList(data) {

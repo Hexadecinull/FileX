@@ -6,23 +6,13 @@ export class FileTree {
     }
 
     _buildTree(entries) {
-        const root    = { name: '/', children: {}, files: [], meta: null };
-        const seen    = new Map();
-        const subSeen = new Set();
+        const root = { name: '/', children: {}, files: [], meta: null };
+        const seen = new Map();
 
         entries.forEach(entry => {
             const { path, source, probe, subdomain } = entry;
 
             if (subdomain) {
-                if (!subSeen.has(subdomain)) {
-                    subSeen.add(subdomain);
-                    if (!root.children['[subdomains]']) {
-                        root.children['[subdomains]'] = { name: '[subdomains]', children: {}, files: [], meta: null };
-                    }
-                    root.children['[subdomains]'].files.push({
-                        name: subdomain, source: 'dns', sources: ['dns'], probe: null, isSubdomain: true
-                    });
-                }
                 return;
             }
 
@@ -165,7 +155,7 @@ export class FileTree {
         const icon = document.createElement('span');
         icon.className   = 'tree-icon';
         icon.textContent = entry.isDir || entry.isSubdomain
-            ? (entry.name === '[subdomains]' ? '🌐' : '📁')
+            ? '📁'
             : this._fileIcon(displayName || entry.name || '');
 
         const name = document.createElement('span');

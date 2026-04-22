@@ -19,7 +19,14 @@ register_shutdown_function(function (): void {
         if (!headers_sent()) {
             header('Content-Type: application/json');
         }
-        echo json_encode(['error' => 'PHP fatal: ' . $e['message'], 'results' => [], 'total' => 0, 'offset' => 0, 'batch' => 0]);
+        echo json_encode([
+            'error'    => 'PHP fatal: ' . $e['message'],
+            'results'  => [],
+            'total'    => 0,
+            'offset'   => 0,
+            'batch'    => 0,
+            'baseline' => null,
+        ]);
     }
 });
 
@@ -31,8 +38,9 @@ if ($domain === '') {
 
 $domain  = strtolower(preg_replace('/^https?:\/\//i', '', $domain));
 $domain  = rtrim(explode('/', $domain)[0], '/');
-$scheme  = in_array(trim($_GET['scheme'] ?? 'https'), ['http', 'https'], true) ? trim($_GET['scheme'] ?? 'https') : 'https';
-$batch   = max(1, min((int) ($_GET['batch'] ?? 30), 60));
+$scheme  = in_array(trim($_GET['scheme'] ?? 'https'), ['http', 'https'], true)
+           ? trim($_GET['scheme'] ?? 'https') : 'https';
+$batch   = max(1, min((int) ($_GET['batch'] ?? 20), 60));
 $offset  = max(0, (int) ($_GET['offset'] ?? 0));
 $custom  = array_filter(array_map('trim', explode("\n", $_GET['paths'] ?? '')));
 
@@ -41,20 +49,36 @@ $wordlist = array_values(array_unique($wordlist));
 $slice    = array_slice($wordlist, $offset, $batch);
 $baseUrl  = $scheme . '://' . $domain;
 
-$results  = [];
-$ch       = curl_init();
-
+$ch = curl_init();
 curl_setopt_array($ch, [
     CURLOPT_RETURNTRANSFER => true,
     CURLOPT_HEADER         => true,
     CURLOPT_FOLLOWLOCATION => false,
-    CURLOPT_TIMEOUT        => 7,
-    CURLOPT_CONNECTTIMEOUT => 4,
+    CURLOPT_TIMEOUT        => 8,
+    CURLOPT_CONNECTTIMEOUT => 5,
     CURLOPT_USERAGENT      => 'Mozilla/5.0 FileX/1.0',
     CURLOPT_SSL_VERIFYPEER => false,
     CURLOPT_SSL_VERIFYHOST => false,
     CURLOPT_ENCODING       => '',
 ]);
+
+$baseline = null;
+if ($offset === 0) {
+    $baseline = buildBaseline($ch, $baseUrl);
+}
+
+$clientBaseline = null;
+$rawBaseline    = $_GET['baseline'] ?? '';
+if ($rawBaseline !== '') {
+    $decoded = json_decode(base64_decode($rawBaseline), true);
+    if (is_array($decoded)) {
+        $clientBaseline = $decoded;
+    }
+}
+
+$effectiveBaseline = $baseline ?? $clientBaseline;
+
+$results = [];
 
 foreach ($slice as $path) {
     $url = $baseUrl . '/' . ltrim($path, '/');
@@ -73,32 +97,131 @@ foreach ($slice as $path) {
     $body        = substr($raw ?: '', $headerSize);
     $headers     = parseHeaders($rawHeaders);
     $contentType = explode(';', $headers['content-type'] ?? '')[0];
+    $bodyLen     = strlen($body);
+    $bodyHash    = md5(substr($body, 0, 512));
+
+    $isBaseline = matchesBaseline($effectiveBaseline, $status, $bodyLen, $bodyHash);
+
+    if ($isBaseline) {
+        continue;
+    }
+
+    $contentLength = isset($headers['content-length'])
+        ? (int) $headers['content-length']
+        : (int) $info['size_download'];
 
     $results[] = [
         'path'             => '/' . ltrim($path, '/'),
         'status'           => $status,
         'contentType'      => $contentType,
-        'contentLength'    => isset($headers['content-length'])
-            ? (int) $headers['content-length']
-            : (int) $info['size_download'],
+        'contentLength'    => $contentLength,
         'server'           => $headers['server'] ?? null,
-        'redirect'         => isset($headers['location'])
-            ? (string) $headers['location']
-            : null,
+        'redirect'         => $headers['location'] ?? null,
         'hasDirectoryList' => detectDirList($body),
-        'interesting'      => isInteresting($status, $path, $body),
+        'interesting'      => isInteresting($status, $path),
     ];
 }
 
 curl_close($ch);
 
-echo json_encode([
+$responseData = [
     'domain'  => $domain,
     'total'   => count($wordlist),
     'offset'  => $offset,
     'batch'   => $batch,
     'results' => $results,
-]);
+];
+
+if ($baseline !== null) {
+    $responseData['baseline']        = $baseline;
+    $responseData['baselineEncoded'] = base64_encode(json_encode($baseline));
+}
+
+echo json_encode($responseData);
+
+function buildBaseline(CurlHandle $ch, string $baseUrl): array
+{
+    $probeSignatures = [];
+
+    $randomPaths = [
+        'filex-probe-' . substr(md5((string) mt_rand()), 0, 10),
+        'filex-probe-' . substr(md5((string) mt_rand()), 0, 10),
+        'filex-probe-' . substr(md5((string) mt_rand()), 0, 10),
+    ];
+
+    foreach ($randomPaths as $rand) {
+        curl_setopt($ch, CURLOPT_URL, $baseUrl . '/' . $rand);
+        $raw  = curl_exec($ch);
+        $info = curl_getinfo($ch);
+
+        $status = (int) $info['http_code'];
+        if ($status === 0) {
+            continue;
+        }
+
+        $body    = substr($raw ?: '', (int) $info['header_size']);
+        $bodyLen = strlen($body);
+        $hash    = md5(substr($body, 0, 512));
+
+        $probeSignatures[] = [
+            'status'  => $status,
+            'bodyLen' => $bodyLen,
+            'hash'    => $hash,
+        ];
+    }
+
+    if (empty($probeSignatures)) {
+        return ['status' => 0, 'bodyLen' => 0, 'hash' => '', 'reliable' => false];
+    }
+
+    $statusCounts  = array_count_values(array_column($probeSignatures, 'status'));
+    $hashCounts    = array_count_values(array_column($probeSignatures, 'hash'));
+    $lenVariances  = array_column($probeSignatures, 'bodyLen');
+
+    arsort($statusCounts);
+    arsort($hashCounts);
+
+    $dominantStatus = (int) array_key_first($statusCounts);
+    $dominantHash   = (string) array_key_first($hashCounts);
+
+    $minLen = min($lenVariances);
+    $maxLen = max($lenVariances);
+    $lenRange = $maxLen - $minLen;
+
+    $reliable = ($statusCounts[$dominantStatus] >= 2)
+             && ($lenRange < 200);
+
+    return [
+        'status'     => $dominantStatus,
+        'bodyLen'    => (int) round(array_sum($lenVariances) / count($lenVariances)),
+        'lenRange'   => $lenRange,
+        'hash'       => $dominantHash,
+        'reliable'   => $reliable,
+        'probeCount' => count($probeSignatures),
+    ];
+}
+
+function matchesBaseline(?array $baseline, int $status, int $bodyLen, string $hash): bool
+{
+    if ($baseline === null || !($baseline['reliable'] ?? false)) {
+        return false;
+    }
+
+    if ($status !== $baseline['status']) {
+        return false;
+    }
+
+    if ($hash === $baseline['hash']) {
+        return true;
+    }
+
+    $tolerance = max(50, ($baseline['lenRange'] ?? 0) + 30);
+    if (abs($bodyLen - $baseline['bodyLen']) <= $tolerance) {
+        return true;
+    }
+
+    return false;
+}
 
 function parseHeaders(string $raw): array
 {
@@ -119,7 +242,7 @@ function detectDirList(string $body): bool
     return (bool) preg_match('/(Index of|Directory listing|Parent Directory)/i', $body);
 }
 
-function isInteresting(int $status, string $path, string $body): bool
+function isInteresting(int $status, string $path): bool
 {
     if ($status === 200 || $status === 206) {
         return true;
@@ -127,13 +250,14 @@ function isInteresting(int $status, string $path, string $body): bool
     if ($status >= 301 && $status <= 308) {
         return true;
     }
-    if ($status === 401 || $status === 403) {
+    if ($status === 401) {
         return true;
     }
     $sensitive = [
-        '.env', 'config', 'backup', 'admin', 'phpmyadmin', 'phpinfo',
-        '.git', '.svn', '.htpasswd', 'passwd', 'credentials',
-        'secret', 'private', 'key', 'token', 'database', 'shell', 'cmd',
+        '.env', '.git', '.svn', '.htpasswd', 'phpinfo', 'phptest',
+        'backup', 'dump.sql', 'db.sql', 'database.sql',
+        'shell', 'cmd', 'eval', 'webshell',
+        'credentials', '.pem', '.key', 'id_rsa',
     ];
     foreach ($sensitive as $p) {
         if (stripos($path, $p) !== false) {
@@ -155,8 +279,7 @@ function getWordlist(): array
         '.DS_Store',
 
         'robots.txt', 'sitemap.xml', 'sitemap_index.xml',
-        'crossdomain.xml', 'humans.txt', 'security.txt',
-        'favicon.ico',
+        'crossdomain.xml', 'humans.txt', 'security.txt', 'favicon.ico',
 
         'index.php', 'index.html', 'index.htm', 'index.asp', 'index.aspx',
         'index.jsp', 'default.php', 'default.html', 'home.php',
@@ -190,8 +313,7 @@ function getWordlist(): array
         'site.tar.gz', 'site.zip', 'www.zip', 'files.zip',
 
         'package.json', 'composer.json', 'requirements.txt',
-        'Dockerfile', 'docker-compose.yml', '.dockerignore',
-        'Makefile', 'Gemfile',
+        'Dockerfile', 'docker-compose.yml', '.dockerignore', 'Makefile', 'Gemfile',
 
         'phpinfo.php', 'info.php', 'php.php', 'test.php', 'debug.php',
         'test.html', 'phptest.php',
@@ -217,17 +339,14 @@ function getWordlist(): array
         'healthcheck', 'ping', 'status', 'metrics',
 
         'phpmyadmin/', 'pma/', 'adminer.php', 'myadmin/',
-        'wp-admin/install.php', 'wp-admin/setup-config.php',
 
         'store/', 'shop/', 'cart/', 'checkout/', 'payment/',
         'order/', 'products/', 'category/',
 
         'feed', 'rss', 'rss.xml', 'atom.xml',
-
         'search', 'search.php', 'contact', 'contact.php', 'about/',
 
         'install.php', 'install/', 'setup.php', 'upgrade.php',
-
         'oauth/', 'oauth2/', 'sso/', 'verify/', 'reset/', 'forgot/',
 
         'news/', 'blog/', 'posts/', 'articles/',
@@ -240,8 +359,6 @@ function getWordlist(): array
         'cron.php', 'tasks/', 'jobs/', 'queue/', 'artisan',
 
         'webmail/', 'mail/', 'roundcube/',
-
-        'app/', 'application/', 'site/', 'web/',
-        'public_html/', 'htdocs/',
+        'app/', 'application/', 'site/', 'web/', 'public_html/', 'htdocs/',
     ];
 }
