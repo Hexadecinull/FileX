@@ -66,7 +66,11 @@ async function apiFetch(endpoint, params, signal) {
     const qs  = new URLSearchParams(params).toString();
     const url = `${API_BASE}/${endpoint}?${qs}`;
     const res = await fetch(url, { signal });
-    if (!res.ok) throw new Error(`HTTP ${res.status} from ${endpoint}`);
+    if (!res.ok) {
+        let errMsg = `HTTP ${res.status}`;
+        try { const j = await res.clone().json(); if (j.error) errMsg = j.error; } catch {}
+        throw new Error(errMsg);
+    }
     return res.json();
 }
 
@@ -236,37 +240,68 @@ async function runScan(domain) {
 
     setStage('Crawl', 'active');
     if (options.crawl()) {
-        const batch = options.batch();
-        let   offset = 0;
-        let   total  = null;
+        const batch    = options.batch();
+        let   offset   = 0;
+        let   total    = null;
+        let   failures = 0;
 
-        try {
-            do {
+        log(`Starting wordlist crawl (batch=${batch})…`);
+
+        while (true) {
+            try {
                 const r = await apiFetch('crawl.php', { domain, scheme, batch, offset }, signal);
-                if (total === null) total = r.total;
+                failures = 0;
 
-                (r.results ?? []).forEach(item => {
+                if (total === null) {
+                    total = r.total ?? 0;
+                    log(`Wordlist has ${total} paths to probe`);
+                }
+
+                const batchResults = r.results ?? [];
+                batchResults.forEach(item => {
                     data.crawl.push(item);
                     addEntry(data, item.path, 'crawl', item);
                 });
 
-                const done  = offset + batch;
-                const pct   = 60 + Math.min(25, Math.round((done / (total || 1)) * 25));
+                const done    = offset + batch;
+                const pct     = 60 + Math.min(25, Math.round((done / (total || 1)) * 25));
+                const hits    = data.crawl.filter(x => x.status > 0 && x.status !== 404).length;
+                const newHits = batchResults.filter(x => x.status > 0 && x.status !== 404);
+
                 setProgress(pct);
-                log(`Crawl ${Math.min(done, total)}/${total} — found ${data.crawl.filter(x => x.status !== 404 && x.status !== 0).length} hits`);
+
+                if (newHits.length > 0) {
+                    log(`Batch ${offset}–${Math.min(done, total)}: ${newHits.map(x => x.path + ' [' + x.status + ']').join(', ')}`, 'success');
+                } else {
+                    log(`Batch ${offset}–${Math.min(done, total)}: no hits (total live: ${hits})`);
+                }
 
                 offset += batch;
-            } while (offset < (total ?? 0));
+                if (offset >= total) break;
 
-            const hits = data.crawl.filter(x => x.status > 0 && x.status !== 404);
-            log(`Crawl complete — ${hits.length} live paths from ${total} probed`, 'success');
-            data.sources.crawl = total;
-            setStage('Crawl', 'done');
-        } catch (e) {
-            if (e.name === 'AbortError') throw e;
-            log(`Crawl error: ${e.message}`, 'warn');
-            setStage('Crawl', 'error');
+            } catch (e) {
+                if (e.name === 'AbortError') throw e;
+                failures++;
+                log(`Crawl batch error (attempt ${failures}/3): ${e.message}`, 'warn');
+                if (failures >= 3) {
+                    log('Crawl aborted after 3 consecutive failures', 'error');
+                    setStage('Crawl', 'error');
+                    break;
+                }
+                await new Promise(r => setTimeout(r, 1500));
+                continue;
+            }
         }
+
+        const hits = data.crawl.filter(x => x.status > 0 && x.status !== 404);
+        if (hits.length > 0) {
+            log(`Crawl complete — ${hits.length} live paths from ${total ?? 0} probed`, 'success');
+            setStage('Crawl', 'done');
+        } else if (total !== null) {
+            log(`Crawl complete — 0 live paths from ${total} probed`);
+            setStage('Crawl', 'done');
+        }
+        data.sources.crawl = total ?? 0;
     } else {
         setStage('Crawl', 'skipped');
     }
@@ -332,15 +367,25 @@ function addEntry(data, path, source, probeResult, subdomain = null) {
 }
 
 function buildStats(data) {
-    const entries  = data.allEntries;
-    const probed   = data.crawl;
-    const live     = probed.filter(x => x.status > 0 && x.status !== 404);
-    const redir    = probed.filter(x => x.status >= 301 && x.status <= 308);
-    const auth     = probed.filter(x => x.status === 401 || x.status === 403);
-    const dirs     = probed.filter(x => x.hasDirectoryList);
-    const uniquePaths = new Set(entries.map(e => e.path));
+    const entries     = data.allEntries;
+    const probed      = data.crawl;
+    const live        = probed.filter(x => x.status > 0 && x.status !== 404);
+    const redir       = probed.filter(x => x.status >= 301 && x.status <= 308);
+    const auth        = probed.filter(x => x.status === 401 || x.status === 403);
+    const dirs        = probed.filter(x => x.hasDirectoryList);
+    const interesting = probed.filter(x => x.interesting);
+    const uniquePaths = new Set(
+        entries.filter(e => !e.subdomain).map(e => e.path)
+    );
 
-    return { total: uniquePaths.size, live: live.length, redir: redir.length, auth: auth.length, dirs: dirs.length };
+    return {
+        total:       uniquePaths.size,
+        live:        live.length,
+        redir:       redir.length,
+        auth:        auth.length,
+        dirs:        dirs.length,
+        interesting: interesting.length,
+    };
 }
 
 function renderStats(stats, data) {
@@ -350,10 +395,11 @@ function renderStats(stats, data) {
     const chips = [
         { label: 'unique paths', value: stats.total,               cls: 'blue' },
         { label: 'live (2xx)',   value: stats.live,                cls: 'green' },
+        { label: '⚡ interesting', value: stats.interesting,       cls: 'amber' },
         { label: 'redirects',   value: stats.redir,               cls: '' },
         { label: '401/403',     value: stats.auth,                cls: 'amber' },
         { label: 'open dirs',   value: stats.dirs,                cls: 'amber' },
-        { label: 'wayback',     value: data.wayback?.total ?? 0,  cls: '' },
+        { label: 'wayback snapshots', value: data.wayback?.total ?? 0, cls: '' },
         { label: 'subdomains',  value: (data.certs?.total ?? 0) + (data.dns?.subdomains?.length ?? 0), cls: '' },
     ];
 

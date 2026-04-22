@@ -6,37 +6,41 @@ export class FileTree {
     }
 
     _buildTree(entries) {
-        const root = { name: '/', children: {}, files: [], meta: null };
-        const seen = new Map();
+        const root    = { name: '/', children: {}, files: [], meta: null };
+        const seen    = new Map();
+        const subSeen = new Set();
 
         entries.forEach(entry => {
             const { path, source, probe, subdomain } = entry;
 
             if (subdomain) {
-                const key = 'subdomain:' + subdomain;
-                if (!seen.has(key)) {
-                    seen.set(key, true);
+                if (!subSeen.has(subdomain)) {
+                    subSeen.add(subdomain);
                     if (!root.children['[subdomains]']) {
                         root.children['[subdomains]'] = { name: '[subdomains]', children: {}, files: [], meta: null };
                     }
-                    root.children['[subdomains]'].files.push({ name: subdomain, source: 'dns', probe: null, isSubdomain: true });
+                    root.children['[subdomains]'].files.push({
+                        name: subdomain, source: 'dns', sources: ['dns'], probe: null, isSubdomain: true
+                    });
                 }
                 return;
             }
 
-            const normalized = ('/' + path.replace(/^\/+/, '')).replace(/\/+/g, '/');
-            const entryKey   = source + ':' + normalized;
+            const normalized = ('/' + (path || '/').replace(/^\/+/, '')).replace(/\/+/g, '/');
 
-            if (seen.has(entryKey)) {
-                const existing = seen.get(entryKey);
-                if (!existing.probe && probe) existing.probe = probe;
+            if (seen.has(normalized)) {
+                const existing = seen.get(normalized);
+                if (!existing.probe && probe) {
+                    existing.probe = probe;
+                    if (existing._dirNode) existing._dirNode.meta = existing;
+                }
                 if (!existing.sources.includes(source)) existing.sources.push(source);
                 return;
             }
 
             const parts    = normalized.split('/').filter(Boolean);
-            const isDir    = normalized.endsWith('/') || (probe === null && parts.length > 0 && !parts[parts.length - 1].includes('.'));
-            const fileName = parts.pop() || '/';
+            const isDir    = normalized.endsWith('/') || (parts.length > 0 && !parts[parts.length - 1].includes('.'));
+            const fileName = parts.pop() || '';
             let   current  = root;
 
             parts.forEach(part => {
@@ -46,14 +50,20 @@ export class FileTree {
                 current = current.children[part];
             });
 
-            const fileEntry = { name: fileName, source, sources: [source], probe, isDir };
-            seen.set(entryKey, fileEntry);
+            const fileEntry = { name: fileName, source, sources: [source], probe, isDir, _dirNode: null };
+            seen.set(normalized, fileEntry);
 
-            if (isDir && parts.length > 0) {
-                current.children[fileName] = current.children[fileName] || {
-                    name: fileName, children: {}, files: [], meta: fileEntry
-                };
-                if (probe) current.children[fileName].meta = fileEntry;
+            if (fileName === '') {
+                return;
+            }
+
+            if (isDir) {
+                if (!current.children[fileName]) {
+                    current.children[fileName] = { name: fileName, children: {}, files: [], meta: fileEntry };
+                } else if (probe) {
+                    current.children[fileName].meta = fileEntry;
+                }
+                fileEntry._dirNode = current.children[fileName];
             } else {
                 current.files.push(fileEntry);
             }
