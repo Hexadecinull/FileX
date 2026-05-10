@@ -1,8 +1,10 @@
 export class FileTree {
     constructor(entries) {
-        this.entries   = entries;
-        this.treeRoot  = this._buildTree(entries);
-        this._nodeEls  = [];
+        this.entries  = entries;
+        this.treeRoot = this._buildTree(entries);
+        this._nodeEls = [];
+        this.baseUrl  = '';
+        this.domain   = '';
     }
 
     _buildTree(entries) {
@@ -11,13 +13,9 @@ export class FileTree {
 
         entries.forEach(entry => {
             const { path, source, probe, subdomain } = entry;
-
-            if (subdomain) {
-                return;
-            }
+            if (subdomain) return;
 
             const normalized = ('/' + (path || '/').replace(/^\/+/, '')).replace(/\/+/g, '/');
-
             if (seen.has(normalized)) {
                 const existing = seen.get(normalized);
                 if (!existing.probe && probe) {
@@ -40,12 +38,17 @@ export class FileTree {
                 current = current.children[part];
             });
 
-            const fileEntry = { name: fileName, source, sources: [source], probe, isDir, _dirNode: null };
+            const fileEntry = {
+                name: fileName,
+                source,
+                sources: [source],
+                probe,
+                isDir,
+                path: normalized,   // full normalized path — used for download links
+                _dirNode: null,
+            };
             seen.set(normalized, fileEntry);
-
-            if (fileName === '') {
-                return;
-            }
+            if (fileName === '') return;
 
             if (isDir) {
                 if (!current.children[fileName]) {
@@ -62,14 +65,16 @@ export class FileTree {
         return root;
     }
 
-    render(container, domain) {
+    render(container, domain, scheme = 'https') {
+        this.domain  = domain;
+        this.baseUrl = `${scheme}://${domain}`;
         container.innerHTML = '';
         this._nodeEls       = [];
 
         if (Object.keys(this.treeRoot.children).length === 0 && this.treeRoot.files.length === 0) {
             const empty = document.createElement('div');
             empty.className   = 'tree-empty';
-            empty.textContent = 'No paths discovered yet.';
+            empty.textContent = 'no paths discovered';
             container.appendChild(empty);
             return;
         }
@@ -97,14 +102,13 @@ export class FileTree {
                     const collapsed = childWrap.classList.toggle('tree-children--hidden');
                     row.toggle.textContent = collapsed ? '+' : '−';
                 });
-
                 this._populateChildren(childWrap, node, depth + 1);
                 wrapper.appendChild(childWrap);
             }
         } else {
             const rootRow = document.createElement('div');
             rootRow.className = 'tree-node-row';
-            rootRow.innerHTML = `<span class="tree-icon">🌐</span><span class="tree-name tree-name--dir">${this._esc(displayName)}/</span>`;
+            rootRow.innerHTML = `<span class="tree-name tree-name--dir">${this._esc(displayName)}/</span>`;
             wrapper.appendChild(rootRow);
 
             const childWrap = document.createElement('div');
@@ -118,15 +122,10 @@ export class FileTree {
     }
 
     _populateChildren(container, node, depth) {
-        const sortedDirs = Object.keys(node.children).sort((a, b) => a.localeCompare(b));
-        sortedDirs.forEach(dirName => {
-            const child  = node.children[dirName];
-            const el     = this._renderNode(child, dirName, depth);
-            container.appendChild(el);
+        Object.keys(node.children).sort((a, b) => a.localeCompare(b)).forEach(dirName => {
+            container.appendChild(this._renderNode(node.children[dirName], dirName, depth));
         });
-
-        const sortedFiles = [...node.files].sort((a, b) => a.name.localeCompare(b.name));
-        sortedFiles.forEach(file => {
+        [...node.files].sort((a, b) => a.name.localeCompare(b.name)).forEach(file => {
             const row = this._buildRow(file, depth, false, file.name);
             container.appendChild(row.el);
             this._nodeEls.push(row.el);
@@ -135,46 +134,43 @@ export class FileTree {
 
     _buildRow(entry, depth, hasChildren, displayName) {
         const el = document.createElement('div');
-        el.className   = 'tree-node-row';
+        el.className    = 'tree-node-row';
         el.dataset.path = displayName || '';
 
+        // Indent
         const indent = document.createElement('span');
         indent.className = 'tree-indent';
         for (let i = 0; i < depth; i++) {
             const c = document.createElement('span');
             c.className   = 'tree-connector';
-            c.textContent = i === depth - 1 ? '├─' : '  ';
+            c.textContent = i === depth - 1 ? '├─' : '│ ';
             indent.appendChild(c);
         }
 
+        // Toggle
         const toggle = document.createElement('span');
         toggle.className   = 'tree-toggle';
         toggle.textContent = hasChildren ? '−' : ' ';
         if (!hasChildren) toggle.style.visibility = 'hidden';
 
-        const icon = document.createElement('span');
-        icon.className   = 'tree-icon';
-        icon.textContent = entry.isDir || entry.isSubdomain
-            ? '📁'
-            : this._fileIcon(displayName || entry.name || '');
-
+        // Name
         const name = document.createElement('span');
-        name.className   = 'tree-name' + (entry.isDir ? ' tree-name--dir' : '') + (entry.isSubdomain ? ' tree-name--link' : '');
-        name.textContent = displayName || entry.name || '/';
+        name.className   = 'tree-name' + (entry.isDir ? ' tree-name--dir' : '');
+        name.textContent = (displayName || entry.name || '/') + (entry.isDir ? '/' : '');
 
         el.appendChild(indent);
         el.appendChild(toggle);
-        el.appendChild(icon);
         el.appendChild(name);
 
+        // Meta section
         const meta = document.createElement('span');
         meta.className = 'tree-meta';
 
         if (entry.probe) {
             const p = entry.probe;
+            const s = p.status || 0;
 
             const status = document.createElement('span');
-            const s      = p.status || 0;
             status.className   = 'tree-status status--' + (s || 'unknown');
             status.textContent = s || '?';
             meta.appendChild(status);
@@ -196,14 +192,14 @@ export class FileTree {
             if (p.hasDirectoryList) {
                 const b = document.createElement('span');
                 b.className   = 'tree-badge badge--dir';
-                b.textContent = 'DIR LIST';
+                b.textContent = 'DIR';
                 meta.appendChild(b);
             }
 
             if (p.interesting) {
                 const b = document.createElement('span');
                 b.className   = 'tree-badge badge--interesting';
-                b.textContent = '⚡';
+                b.textContent = 'hit';
                 meta.appendChild(b);
                 el.dataset.interesting = '1';
             }
@@ -214,16 +210,40 @@ export class FileTree {
                 b.textContent = '→ ' + p.redirect.replace(/^https?:\/\/[^/]+/, '').slice(0, 30);
                 meta.appendChild(b);
             }
+
+            // Download / open actions for successful responses
+            if (s >= 200 && s < 300 && this.baseUrl) {
+                const entryPath = entry.path || ('/' + (displayName || entry.name || ''));
+                const fullUrl   = this.baseUrl + entryPath;
+
+                const openLink = document.createElement('a');
+                openLink.href      = fullUrl;
+                openLink.target    = '_blank';
+                openLink.rel       = 'noopener noreferrer';
+                openLink.className = 'tree-action tree-action--open';
+                openLink.textContent = '↗';
+                openLink.title     = fullUrl;
+                openLink.addEventListener('click', e => e.stopPropagation());
+                meta.appendChild(openLink);
+
+                // Proxy download — routes through download.php so browser triggers save dialog
+                const dlLink = document.createElement('a');
+                dlLink.href      = `./api/download.php?domain=${encodeURIComponent(this.domain)}&url=${encodeURIComponent(fullUrl)}`;
+                dlLink.className = 'tree-action tree-action--dl';
+                dlLink.textContent = '↓';
+                dlLink.title     = 'download via proxy';
+                dlLink.addEventListener('click', e => e.stopPropagation());
+                meta.appendChild(dlLink);
+            }
         }
 
-        if (entry.sources?.length > 0 || entry.source) {
-            const src = (entry.sources || [entry.source]).filter(Boolean)[0];
-            if (src) {
-                const s = document.createElement('span');
-                s.className   = 'tree-source source--' + src;
-                s.textContent = src;
-                meta.appendChild(s);
-            }
+        // Source badge
+        const src = (entry.sources || [entry.source]).filter(Boolean)[0];
+        if (src) {
+            const s = document.createElement('span');
+            s.className   = 'tree-source source--' + src;
+            s.textContent = src;
+            meta.appendChild(s);
         }
 
         el.appendChild(meta);
@@ -248,11 +268,10 @@ export class FileTree {
         });
     }
 
-    filterInteresting(onlyInteresting) {
+    filterInteresting(only) {
         document.querySelectorAll('.tree-node-row').forEach(el => {
-            if (onlyInteresting) {
-                const isInteresting = el.dataset.interesting === '1';
-                el.closest('.tree-node')?.classList.toggle('tree-node--hidden', !isInteresting);
+            if (only) {
+                el.closest('.tree-node')?.classList.toggle('tree-node--hidden', el.dataset.interesting !== '1');
             } else {
                 el.closest('.tree-node')?.classList.remove('tree-node--hidden');
             }
@@ -262,62 +281,34 @@ export class FileTree {
     search(query) {
         const q = query.toLowerCase();
         document.querySelectorAll('.tree-node-row').forEach(el => {
-            const path = (el.dataset.path || '').toLowerCase();
-            const match = !q || path.includes(q);
-            el.style.display = match ? '' : 'none';
+            el.style.display = (!q || (el.dataset.path || '').toLowerCase().includes(q)) ? '' : 'none';
         });
     }
 
-    toText(node = this.treeRoot, prefix = '', isLast = true) {
+    toText(node = this.treeRoot, prefix = '') {
         let out = '';
-        const children  = Object.entries(node.children || {});
-        const files     = node.files || [];
-
-        const allItems  = [
+        const children = Object.entries(node.children || {});
+        const files    = node.files || [];
+        const all = [
             ...children.map(([n, c]) => ({ name: n, isDir: true, node: c })),
             ...files.map(f => ({ name: f.name, isDir: false, probe: f.probe, sources: f.sources })),
-        ].sort((a, b) => {
-            if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
-            return a.name.localeCompare(b.name);
-        });
+        ].sort((a, b) => (a.isDir !== b.isDir ? (a.isDir ? -1 : 1) : a.name.localeCompare(b.name)));
 
-        allItems.forEach((item, i) => {
-            const last    = i === allItems.length - 1;
-            const branch  = last ? '└── ' : '├── ';
-            const extend  = last ? '    ' : '│   ';
-            const status  = item.probe ? ` [${item.probe.status}]` : '';
-            const src     = item.sources ? ` (${item.sources.join(',')})` : '';
+        all.forEach((item, i) => {
+            const last   = i === all.length - 1;
+            const branch = last ? '└── ' : '├── ';
+            const extend = last ? '    ' : '│   ';
+            const status = item.probe ? ` [${item.probe.status}]` : '';
+            const src    = item.sources?.length ? ` (${item.sources.join(',')})` : '';
             out += prefix + branch + item.name + (item.isDir ? '/' : '') + status + src + '\n';
-            if (item.isDir) {
-                out += this.toText(item.node, prefix + extend, last);
-            }
+            if (item.isDir) out += this.toText(item.node, prefix + extend);
         });
 
         return out;
     }
 
-    _fileIcon(name) {
-        const ext = (name.split('.').pop() || '').toLowerCase();
-        const map = {
-            php: '🐘', js: '📜', ts: '📜', jsx: '⚛️', tsx: '⚛️',
-            html: '🌐', htm: '🌐', css: '🎨', scss: '🎨', sass: '🎨',
-            json: '📋', xml: '📋', yaml: '📋', yml: '📋', toml: '📋',
-            sql: '🗄️', db: '🗄️', sqlite: '🗄️',
-            png: '🖼️', jpg: '🖼️', jpeg: '🖼️', gif: '🖼️', svg: '🖼️', webp: '🖼️', ico: '🖼️',
-            pdf: '📄', doc: '📝', docx: '📝', xls: '📊', xlsx: '📊',
-            zip: '📦', gz: '📦', tar: '📦', bak: '💾',
-            env: '🔑', key: '🔑', pem: '🔑', crt: '🔑',
-            log: '📃', txt: '📃', md: '📃',
-            sh: '⚙️', bash: '⚙️', py: '🐍', rb: '💎', go: '🔵',
-        };
-        return map[ext] || '📄';
-    }
-
     _esc(str) {
-        return String(str)
-            .replace(/&/g, '&amp;')
-            .replace(/</g, '&lt;')
-            .replace(/>/g, '&gt;');
+        return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
     }
 
     _formatBytes(n) {
