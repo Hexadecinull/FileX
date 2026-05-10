@@ -224,7 +224,13 @@ async function runScan(domain) {
         let failures = 0;
         let done     = false;
 
-        log('spider crawl -- following real links from /');
+        // Seed queue from already-discovered real paths (robots, sitemap, wayback)
+        // Always include / but also every known path so we aren't blocked by a dead root
+        const seededPaths = new Set(['/']);
+        data.allEntries.forEach(e => { if (e.path) seededPaths.add(e.path); });
+        queue = Array.from(seededPaths);
+
+        log(`spider crawl -- seeded with ${queue.length} known paths`);
 
         while (!done) {
             try {
