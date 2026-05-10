@@ -16,17 +16,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
 register_shutdown_function(function (): void {
     $e = error_get_last();
     if ($e && in_array($e['type'], [E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR], true)) {
-        if (!headers_sent()) {
-            header('Content-Type: application/json');
-        }
-        echo json_encode([
-            'error'    => 'PHP fatal: ' . $e['message'],
-            'results'  => [],
-            'total'    => 0,
-            'offset'   => 0,
-            'batch'    => 0,
-            'baseline' => null,
-        ]);
+        if (!headers_sent()) header('Content-Type: application/json');
+        echo json_encode(['error' => 'PHP fatal: ' . $e['message'], 'results' => [], 'total' => 0, 'done' => true]);
     }
 });
 
@@ -40,14 +31,22 @@ $domain  = strtolower(preg_replace('/^https?:\/\//i', '', $domain));
 $domain  = rtrim(explode('/', $domain)[0], '/');
 $scheme  = in_array(trim($_GET['scheme'] ?? 'https'), ['http', 'https'], true)
            ? trim($_GET['scheme'] ?? 'https') : 'https';
-$batch   = max(1, min((int) ($_GET['batch'] ?? 20), 60));
-$offset  = max(0, (int) ($_GET['offset'] ?? 0));
-$custom  = array_filter(array_map('trim', explode("\n", $_GET['paths'] ?? '')));
+$batch   = max(1, min((int)($_GET['batch'] ?? 20), 60));
+$baseUrl = $scheme . '://' . $domain;
 
-$wordlist = array_merge(getWordlist(), $custom);
-$wordlist = array_values(array_unique($wordlist));
-$slice    = array_slice($wordlist, $offset, $batch);
-$baseUrl  = $scheme . '://' . $domain;
+// Queue is passed as JSON from the client between batches
+$queue   = json_decode($_GET['queue'] ?? '[]', true);
+if (!is_array($queue)) $queue = [];
+
+// Visited set passed from client
+$visited = json_decode($_GET['visited'] ?? '[]', true);
+if (!is_array($visited)) $visited = [];
+$visitedSet = array_flip($visited);
+
+// On first call, seed the queue with the root
+if (empty($queue) && empty($visited)) {
+    $queue = ['/'];
+}
 
 $ch = curl_init();
 curl_setopt_array($ch, [
@@ -62,165 +61,227 @@ curl_setopt_array($ch, [
     CURLOPT_ENCODING       => '',
 ]);
 
+// Build baseline on first call
 $baseline = null;
-if ($offset === 0) {
+if (empty($visited)) {
     $baseline = buildBaseline($ch, $baseUrl);
 }
-
 $clientBaseline = null;
-$rawBaseline    = $_GET['baseline'] ?? '';
+$rawBaseline = $_GET['baseline'] ?? '';
 if ($rawBaseline !== '') {
     $decoded = json_decode(base64_decode($rawBaseline), true);
-    if (is_array($decoded)) {
-        $clientBaseline = $decoded;
-    }
+    if (is_array($decoded)) $clientBaseline = $decoded;
 }
-
 $effectiveBaseline = $baseline ?? $clientBaseline;
 
-$results = [];
+$results    = [];
+$newQueue   = [];
+$processed  = 0;
 
-foreach ($slice as $path) {
-    $url = $baseUrl . '/' . ltrim($path, '/');
+while (!empty($queue) && $processed < $batch) {
+    $path = array_shift($queue);
+    $norm = normalizePath($path);
+
+    if ($norm === null || isset($visitedSet[$norm])) continue;
+    $visitedSet[$norm] = true;
+    $visited[]         = $norm;
+    $processed++;
+
+    $url = $baseUrl . $norm;
     curl_setopt($ch, CURLOPT_URL, $url);
 
     $raw  = curl_exec($ch);
     $info = curl_getinfo($ch);
 
-    $status = (int) $info['http_code'];
-    if ($status === 0) {
-        continue;
-    }
+    $status = (int)$info['http_code'];
+    if ($status === 0) continue;
 
-    $headerSize  = (int) $info['header_size'];
-    $rawHeaders  = substr($raw ?: '', 0, $headerSize);
-    $body        = substr($raw ?: '', $headerSize);
-    $headers     = parseHeaders($rawHeaders);
+    $headerSize = (int)$info['header_size'];
+    $rawHeaders = substr($raw ?: '', 0, $headerSize);
+    $body       = substr($raw ?: '', $headerSize);
+    $headers    = parseHeaders($rawHeaders);
     $contentType = explode(';', $headers['content-type'] ?? '')[0];
-    $bodyLen     = strlen($body);
-    $bodyHash    = md5(substr($body, 0, 512));
+    $bodyLen    = strlen($body);
+    $bodyHash   = md5(substr($body, 0, 512));
 
-    $isBaseline = matchesBaseline($effectiveBaseline, $status, $bodyLen, $bodyHash);
-
-    if ($isBaseline) {
-        continue;
-    }
+    if (matchesBaseline($effectiveBaseline, $status, $bodyLen, $bodyHash)) continue;
 
     $contentLength = isset($headers['content-length'])
-        ? (int) $headers['content-length']
-        : (int) $info['size_download'];
+        ? (int)$headers['content-length']
+        : (int)$info['size_download'];
 
-    $results[] = [
-        'path'             => '/' . ltrim($path, '/'),
+    $result = [
+        'path'             => $norm,
         'status'           => $status,
         'contentType'      => $contentType,
         'contentLength'    => $contentLength,
         'server'           => $headers['server'] ?? null,
         'redirect'         => $headers['location'] ?? null,
         'hasDirectoryList' => detectDirList($body),
-        'interesting'      => isInteresting($status, $path),
+        'interesting'      => isInteresting($status, $norm),
     ];
+    $results[] = $result;
+
+    // Follow redirects within same domain
+    if ($status >= 301 && $status <= 308 && isset($headers['location'])) {
+        $loc = resolveUrl($headers['location'], $baseUrl, $norm);
+        if ($loc !== null && !isset($visitedSet[$loc])) {
+            array_unshift($queue, $loc); // prioritize
+        }
+    }
+
+    // Extract links from HTML/JS/CSS bodies
+    if ($status >= 200 && $status < 300) {
+        $isHtml = stripos($contentType, 'html') !== false;
+        $isJs   = stripos($contentType, 'javascript') !== false;
+        $isCss  = stripos($contentType, 'css') !== false;
+
+        if ($isHtml || $isJs || $isCss) {
+            $links = extractLinks($body, $baseUrl, $norm);
+            foreach ($links as $link) {
+                if (!isset($visitedSet[$link])) {
+                    $queue[] = $link;
+                }
+            }
+        }
+    }
 }
 
 curl_close($ch);
 
-$responseData = [
+// Deduplicate queue before sending back
+$queue = array_values(array_unique(array_filter($queue, fn($p) => !isset($visitedSet[$p]))));
+
+$done = empty($queue);
+
+$response = [
     'domain'  => $domain,
-    'total'   => count($wordlist),
-    'offset'  => $offset,
-    'batch'   => $batch,
     'results' => $results,
+    'total'   => count($visited),
+    'done'    => $done,
+    'queue'   => $queue,
+    'visited' => $visited,
 ];
 
 if ($baseline !== null) {
-    $responseData['baseline']        = $baseline;
-    $responseData['baselineEncoded'] = base64_encode(json_encode($baseline));
+    $response['baseline']        = $baseline;
+    $response['baselineEncoded'] = base64_encode(json_encode($baseline));
 }
 
-echo json_encode($responseData);
+echo json_encode($response);
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+function normalizePath(string $path): ?string
+{
+    // Strip fragment
+    $path = preg_replace('/#.*$/', '', $path);
+    // Must start with /
+    if (!str_starts_with($path, '/')) return null;
+    // Remove query string for dedup purposes (keep the path only)
+    $path = preg_replace('/\?.*$/', '', $path);
+    // Collapse double slashes
+    $path = preg_replace('/\/+/', '/', $path);
+    // Resolve . and ..
+    $parts  = explode('/', $path);
+    $stack  = [];
+    foreach ($parts as $part) {
+        if ($part === '..') { array_pop($stack); }
+        elseif ($part !== '.') { $stack[] = $part; }
+    }
+    $norm = implode('/', $stack);
+    if (!str_starts_with($norm, '/')) $norm = '/' . $norm;
+    return $norm ?: '/';
+}
+
+function resolveUrl(string $href, string $baseUrl, string $currentPath): ?string
+{
+    if (str_starts_with($href, 'http://') || str_starts_with($href, 'https://')) {
+        $parsed = parse_url($href);
+        $hHost  = strtolower($parsed['host'] ?? '');
+        $bHost  = strtolower(parse_url($baseUrl, PHP_URL_HOST) ?? '');
+        if ($hHost !== $bHost) return null;
+        return normalizePath($parsed['path'] ?? '/');
+    }
+    if (str_starts_with($href, '//')) return null;
+    if (str_starts_with($href, '/')) return normalizePath($href);
+    // Relative path
+    $base = rtrim(dirname($currentPath), '/') . '/';
+    return normalizePath($base . $href);
+}
+
+function extractLinks(string $body, string $baseUrl, string $currentPath): array
+{
+    $links = [];
+
+    // href, src, action, data-src, data-href
+    preg_match_all('/(?:href|src|action|data-src|data-href)\s*=\s*["\']([^"\'>\s]+)["\']/', $body, $m1);
+    // url() in CSS / JS strings
+    preg_match_all('/url\(["\']?([^"\')\s]+)["\']?\)/', $body, $m2);
+    // JS import / require / fetch strings (heuristic)
+    preg_match_all('/(?:import|require|fetch)\s*\(\s*["\']([^"\']+)["\']/', $body, $m3);
+    // JS source maps
+    preg_match_all('/sourceMappingURL=([^\s*]+)/', $body, $m4);
+
+    $candidates = array_merge($m1[1], $m2[1], $m3[1], $m4[1]);
+
+    foreach ($candidates as $href) {
+        $href = trim($href);
+        if ($href === '' || str_starts_with($href, 'data:') || str_starts_with($href, 'mailto:')
+            || str_starts_with($href, 'javascript:') || str_starts_with($href, 'tel:')) {
+            continue;
+        }
+        $resolved = resolveUrl($href, $baseUrl, $currentPath);
+        if ($resolved !== null) {
+            $links[] = $resolved;
+        }
+    }
+
+    return array_unique($links);
+}
 
 function buildBaseline(CurlHandle $ch, string $baseUrl): array
 {
-    $probeSignatures = [];
-
-    $randomPaths = [
-        'filex-probe-' . substr(md5((string) mt_rand()), 0, 10),
-        'filex-probe-' . substr(md5((string) mt_rand()), 0, 10),
-        'filex-probe-' . substr(md5((string) mt_rand()), 0, 10),
-    ];
-
-    foreach ($randomPaths as $rand) {
+    $sigs = [];
+    for ($i = 0; $i < 3; $i++) {
+        $rand = 'filex-noexist-' . substr(md5((string)mt_rand()), 0, 10);
         curl_setopt($ch, CURLOPT_URL, $baseUrl . '/' . $rand);
         $raw  = curl_exec($ch);
         $info = curl_getinfo($ch);
-
-        $status = (int) $info['http_code'];
-        if ($status === 0) {
-            continue;
-        }
-
-        $body    = substr($raw ?: '', (int) $info['header_size']);
+        $status = (int)$info['http_code'];
+        if ($status === 0) continue;
+        $body    = substr($raw ?: '', (int)$info['header_size']);
         $bodyLen = strlen($body);
-        $hash    = md5(substr($body, 0, 512));
-
-        $probeSignatures[] = [
-            'status'  => $status,
-            'bodyLen' => $bodyLen,
-            'hash'    => $hash,
-        ];
+        $sigs[]  = ['status' => $status, 'bodyLen' => $bodyLen, 'hash' => md5(substr($body, 0, 512))];
     }
+    if (empty($sigs)) return ['status' => 0, 'bodyLen' => 0, 'hash' => '', 'reliable' => false];
 
-    if (empty($probeSignatures)) {
-        return ['status' => 0, 'bodyLen' => 0, 'hash' => '', 'reliable' => false];
-    }
-
-    $statusCounts  = array_count_values(array_column($probeSignatures, 'status'));
-    $hashCounts    = array_count_values(array_column($probeSignatures, 'hash'));
-    $lenVariances  = array_column($probeSignatures, 'bodyLen');
-
+    $statusCounts = array_count_values(array_column($sigs, 'status'));
+    $hashCounts   = array_count_values(array_column($sigs, 'hash'));
+    $lens         = array_column($sigs, 'bodyLen');
     arsort($statusCounts);
     arsort($hashCounts);
 
-    $dominantStatus = (int) array_key_first($statusCounts);
-    $dominantHash   = (string) array_key_first($hashCounts);
-
-    $minLen = min($lenVariances);
-    $maxLen = max($lenVariances);
-    $lenRange = $maxLen - $minLen;
-
-    $reliable = ($statusCounts[$dominantStatus] >= 2)
-             && ($lenRange < 200);
+    $domStatus = (int)array_key_first($statusCounts);
+    $domHash   = (string)array_key_first($hashCounts);
+    $lenRange  = max($lens) - min($lens);
 
     return [
-        'status'     => $dominantStatus,
-        'bodyLen'    => (int) round(array_sum($lenVariances) / count($lenVariances)),
+        'status'     => $domStatus,
+        'bodyLen'    => (int)round(array_sum($lens) / count($lens)),
         'lenRange'   => $lenRange,
-        'hash'       => $dominantHash,
-        'reliable'   => $reliable,
-        'probeCount' => count($probeSignatures),
+        'hash'       => $domHash,
+        'reliable'   => ($statusCounts[$domStatus] >= 2) && ($lenRange < 200),
+        'probeCount' => count($sigs),
     ];
 }
 
-function matchesBaseline(?array $baseline, int $status, int $bodyLen, string $hash): bool
+function matchesBaseline(?array $b, int $status, int $bodyLen, string $hash): bool
 {
-    if ($baseline === null || !($baseline['reliable'] ?? false)) {
-        return false;
-    }
-
-    if ($status !== $baseline['status']) {
-        return false;
-    }
-
-    if ($hash === $baseline['hash']) {
-        return true;
-    }
-
-    $tolerance = max(50, ($baseline['lenRange'] ?? 0) + 30);
-    if (abs($bodyLen - $baseline['bodyLen']) <= $tolerance) {
-        return true;
-    }
-
-    return false;
+    if ($b === null || !($b['reliable'] ?? false)) return false;
+    if ($status !== $b['status']) return false;
+    if ($hash === $b['hash']) return true;
+    return abs($bodyLen - $b['bodyLen']) <= max(50, ($b['lenRange'] ?? 0) + 30);
 }
 
 function parseHeaders(string $raw): array
@@ -228,137 +289,24 @@ function parseHeaders(string $raw): array
     $headers = [];
     foreach (explode("\r\n", $raw) as $line) {
         $pos = strpos($line, ':');
-        if ($pos === false) {
-            continue;
-        }
-        $key           = strtolower(trim(substr($line, 0, $pos)));
-        $headers[$key] = trim(substr($line, $pos + 1));
+        if ($pos === false) continue;
+        $headers[strtolower(trim(substr($line, 0, $pos)))] = trim(substr($line, $pos + 1));
     }
     return $headers;
 }
 
 function detectDirList(string $body): bool
 {
-    return (bool) preg_match('/(Index of|Directory listing|Parent Directory)/i', $body);
+    return (bool)preg_match('/(Index of|Directory listing|Parent Directory)/i', $body);
 }
 
 function isInteresting(int $status, string $path): bool
 {
-    if ($status === 200 || $status === 206) {
-        return true;
-    }
-    if ($status >= 301 && $status <= 308) {
-        return true;
-    }
-    if ($status === 401) {
-        return true;
-    }
-    $sensitive = [
-        '.env', '.git', '.svn', '.htpasswd', 'phpinfo', 'phptest',
-        'backup', 'dump.sql', 'db.sql', 'database.sql',
-        'shell', 'cmd', 'eval', 'webshell',
-        'credentials', '.pem', '.key', 'id_rsa',
-    ];
-    foreach ($sensitive as $p) {
-        if (stripos($path, $p) !== false) {
-            return true;
-        }
+    if ($status === 200 || $status === 206) return true;
+    if ($status >= 301 && $status <= 308) return true;
+    if ($status === 401) return true;
+    foreach (['.env', '.git', '.svn', '.htpasswd', 'phpinfo', 'backup', 'dump.sql', 'db.sql', '.pem', '.key', 'id_rsa', 'credentials', 'webshell', 'shell.php'] as $p) {
+        if (stripos($path, $p) !== false) return true;
     }
     return false;
-}
-
-function getWordlist(): array
-{
-    return [
-        '.env', '.env.local', '.env.example', '.env.development', '.env.production',
-        '.env.backup', '.env.bak', '.env.old',
-        '.git/HEAD', '.git/config', '.gitignore',
-        '.svn/entries', '.htaccess', '.htpasswd',
-        '.well-known/security.txt', '.well-known/openid-configuration',
-        '.well-known/apple-app-site-association', '.well-known/assetlinks.json',
-        '.DS_Store',
-
-        'robots.txt', 'sitemap.xml', 'sitemap_index.xml',
-        'crossdomain.xml', 'humans.txt', 'security.txt', 'favicon.ico',
-
-        'index.php', 'index.html', 'index.htm', 'index.asp', 'index.aspx',
-        'index.jsp', 'default.php', 'default.html', 'home.php',
-
-        'admin/', 'admin/index.php', 'admin/login.php', 'admin/dashboard.php',
-        'administrator/', 'administrator/index.php',
-        'wp-admin/', 'wp-login.php', 'wp-config.php', 'wp-config.php.bak',
-        'wp-content/', 'wp-includes/', 'wp-json/', 'wp-cron.php',
-        'wp-content/debug.log', 'wp-content/uploads/',
-        'xmlrpc.php',
-
-        'panel/', 'cpanel/', 'dashboard/', 'backend/', 'cms/', 'portal/',
-        'secure/', 'private/', 'internal/', 'staff/', 'admin2/',
-
-        'login', 'login.php', 'login.html', 'login/',
-        'signin', 'signin.php', 'signup', 'signup.php',
-        'register', 'register.php', 'logout', 'auth/',
-
-        'api/', 'api/v1/', 'api/v2/', 'api/v3/', 'api/index.php',
-        'api/users', 'api/login', 'api/auth', 'api/status', 'api/health',
-        'v1/', 'v2/', 'v3/', 'graphql', 'graphql/',
-        'swagger/', 'swagger.json', 'openapi.json', 'api-docs/',
-
-        'config.php', 'config.js', 'config.json', 'config.xml', 'config.yml',
-        'configuration.php', 'settings.php', 'settings.py',
-        'database.php', 'db.php', 'web.config', 'appsettings.json',
-        'app/config/', 'application.yml',
-
-        'backup/', 'backup.sql', 'backup.zip', 'backup.tar.gz',
-        'db.sql', 'database.sql', 'dump.sql',
-        'site.tar.gz', 'site.zip', 'www.zip', 'files.zip',
-
-        'package.json', 'composer.json', 'requirements.txt',
-        'Dockerfile', 'docker-compose.yml', '.dockerignore', 'Makefile', 'Gemfile',
-
-        'phpinfo.php', 'info.php', 'php.php', 'test.php', 'debug.php',
-        'test.html', 'phptest.php',
-
-        'logs/', 'log/', 'error.log', 'access.log', 'debug.log',
-        'storage/logs/', 'laravel.log',
-
-        'upload/', 'uploads/', 'files/', 'media/',
-        'images/', 'img/', 'static/', 'assets/', 'storage/', 'data/',
-
-        'js/', 'css/', 'fonts/', 'dist/', 'src/', 'build/',
-        'bundle.js', 'app.js', 'main.js', 'vendor.js',
-
-        'docs/', 'doc/', 'documentation/', 'help/', 'wiki/',
-        'readme.md', 'README.txt', 'CHANGELOG.md',
-
-        'includes/', 'lib/', 'vendor/', 'modules/', 'plugins/',
-        'components/', 'classes/', 'models/', 'controllers/',
-
-        'dev/', 'staging/', 'test/', 'tmp/', 'temp/', 'cache/',
-
-        'server-status', 'nginx_status', 'health', 'health/',
-        'healthcheck', 'ping', 'status', 'metrics',
-
-        'phpmyadmin/', 'pma/', 'adminer.php', 'myadmin/',
-
-        'store/', 'shop/', 'cart/', 'checkout/', 'payment/',
-        'order/', 'products/', 'category/',
-
-        'feed', 'rss', 'rss.xml', 'atom.xml',
-        'search', 'search.php', 'contact', 'contact.php', 'about/',
-
-        'install.php', 'install/', 'setup.php', 'upgrade.php',
-        'oauth/', 'oauth2/', 'sso/', 'verify/', 'reset/', 'forgot/',
-
-        'news/', 'blog/', 'posts/', 'articles/',
-        'gallery/', 'photos/', 'videos/',
-
-        'export/', 'report/', 'reports/', 'analytics/',
-
-        'sitemap-news.xml', 'sitemap-video.xml', 'sitemap-image.xml',
-
-        'cron.php', 'tasks/', 'jobs/', 'queue/', 'artisan',
-
-        'webmail/', 'mail/', 'roundcube/',
-        'app/', 'application/', 'site/', 'web/', 'public_html/', 'htdocs/',
-    ];
 }

@@ -214,20 +214,25 @@ async function runScan(domain) {
 
     setProgress(60);
 
-    // wordlist crawl
+    // spider crawl
     setStage('Crawl', 'active');
     if (options.crawl()) {
-        const batch  = options.batch();
-        let offset   = 0;
-        let total    = null;
-        let failures = 0;
+        const batch = options.batch();
+        let queue   = [];
+        let visited = [];
         let baselineEncoded = null;
+        let failures = 0;
+        let done     = false;
 
-        log(`wordlist crawl — batch size ${batch}`);
+        log('spider crawl -- following real links from /');
 
-        while (true) {
+        while (!done) {
             try {
-                const params = { domain, scheme, batch, offset };
+                const params = {
+                    domain, scheme, batch,
+                    queue:   JSON.stringify(queue),
+                    visited: JSON.stringify(visited),
+                };
                 if (baselineEncoded) params.baseline = baselineEncoded;
 
                 const r = await apiFetch('crawl.php', params, signal);
@@ -237,17 +242,15 @@ async function runScan(domain) {
                     data.crawlBaseline = r.baseline;
                     baselineEncoded    = r.baselineEncoded ?? null;
                     const b = r.baseline;
-                    if (b.reliable) {
-                        log(`baseline: status=${b.status} body≈${b.bodyLen}b — filtering false positives`, 'success');
-                    } else {
-                        log(`baseline unreliable — results may include false positives`, 'warn');
-                    }
+                    log(b.reliable
+                        ? `baseline: status=${b.status} body~${b.bodyLen}b`
+                        : 'baseline unreliable -- false positives possible',
+                        b.reliable ? 'success' : 'warn');
                 }
 
-                if (total === null) {
-                    total = r.total ?? 0;
-                    log(`wordlist: ${total} paths to probe`);
-                }
+                queue   = r.queue   ?? [];
+                visited = r.visited ?? [];
+                done    = r.done    ?? true;
 
                 const batchRes = r.results ?? [];
                 batchRes.forEach(item => {
@@ -255,20 +258,17 @@ async function runScan(domain) {
                     addEntry(data, item.path, 'crawl', item);
                 });
 
-                const done    = offset + batch;
-                const pct     = 60 + Math.min(25, Math.round((done / (total || 1)) * 25));
-                const hits    = batchRes.filter(x => x.interesting);
-
+                const hits = batchRes.filter(x => x.interesting);
+                const pct  = Math.min(84, 60 + Math.round(
+                    (visited.length / Math.max(visited.length + queue.length, 1)) * 24
+                ));
                 setProgress(pct);
 
                 if (hits.length > 0) {
-                    log(`[${offset}–${Math.min(done, total)}] found: ${hits.map(x => x.path + ' [' + x.status + ']').join(', ')}`, 'success');
-                } else {
-                    log(`[${offset}–${Math.min(done, total)}] — ${batchRes.length} probed`);
+                    log(`[${visited.length} visited / ${queue.length} queued] found: ${hits.map(x => x.path + ' [' + x.status + ']').join(', ')}`, 'success');
+                } else if (batchRes.length > 0) {
+                    log(`[${visited.length} visited / ${queue.length} queued] ${batchRes.length} pages crawled`);
                 }
-
-                offset += batch;
-                if (offset >= total) break;
 
             } catch (e) {
                 if (e.name === 'AbortError') throw e;
@@ -279,15 +279,14 @@ async function runScan(domain) {
                     setStage('Crawl', 'error');
                     break;
                 }
-                await new Promise(r => window.setTimeout(r, 1500));
-                continue;
+                await new Promise(res => window.setTimeout(res, 1500));
             }
         }
 
         const hits = data.crawl.filter(x => x.interesting);
-        log(`crawl done — ${hits.length} real paths found (${total ?? 0} probed)`, hits.length > 0 ? 'success' : '');
+        log(`crawl done -- ${visited.length} pages visited, ${hits.length} interesting`, hits.length > 0 ? 'success' : '');
         setStage('Crawl', 'done');
-        data.sources.crawl = total ?? 0;
+        data.sources.crawl = visited.length;
     } else setStage('Crawl', 'skipped');
 
     setProgress(85);
@@ -478,7 +477,7 @@ function renderSourcesList(data) {
         { name: 'robots.txt',     count: data.sources.robots,  pfx: 'robots' },
         { name: 'sitemap',        count: data.sources.sitemap, pfx: 'sitemap' },
         { name: 'wayback machine',count: data.sources.wayback, pfx: 'wayback' },
-        { name: 'wordlist crawl', count: data.sources.crawl,   pfx: 'crawl' },
+        { name: 'spider crawl', count: data.sources.crawl,   pfx: 'crawl' },
         { name: 'link probe',     count: data.sources.probe,   pfx: 'probe' },
         { name: 'dns subdomains', count: data.sources.dns,     pfx: 'dns' },
     ].forEach(({ name, count, pfx }) => {
