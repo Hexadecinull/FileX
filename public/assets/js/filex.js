@@ -97,12 +97,6 @@ function esc(str) {
         .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
-function formatBytes(n) {
-    if (!n || n < 0) return '';
-    if (n < 1024) return n + 'B';
-    if (n < 1048576) return (n / 1024).toFixed(1) + 'KB';
-    return (n / 1048576).toFixed(1) + 'MB';
-}
 
 function addEntry(data, path, source, probeResult) {
     if (!path) return;
@@ -285,7 +279,7 @@ async function runScan(domain) {
                     setStage('Crawl', 'error');
                     break;
                 }
-                await new Promise(r => setTimeout(r, 1500));
+                await new Promise(r => window.setTimeout(r, 1500));
                 continue;
             }
         }
